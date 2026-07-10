@@ -1,0 +1,9 @@
+{
+  "project": "Athena AX6600 DAE Builder",
+  "device": "JDCloud RE-CS-02",
+  "target": "qualcommax/ipq60xx",
+  "default_lan_ip": "192.168.50.1",
+  "proxy_backend": "dae",
+  "btf": "integrated kernel BTF",
+  "nss_ecm": "module only, not installed by default"
+}
