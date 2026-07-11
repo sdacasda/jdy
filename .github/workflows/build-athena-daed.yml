@@ -1,0 +1,523 @@
+name: Build Athena AX6600 DAED
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "雅典娜固件源码分支/标签/提交"
+        required: true
+        default: "main"
+        type: string
+      daede_ref:
+        description: "openwrt-daede 分支/标签/提交；main=最新版"
+        required: true
+        default: "main"
+        type: string
+      config_only:
+        description: "只检查配置，不编译固件"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: athena-daed-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: RE-CS-02 / DAED / BTF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      SOURCE_REPO: https://github.com/VIKINGYFY/immortalwrt.git
+      DAEDE_REPO: https://github.com/kenzok8/openwrt-daede.git
+      GEODATA_REPO: https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git
+      SOURCE_REF: ${{ inputs.source_ref }}
+      DAEDE_REF: ${{ inputs.daede_ref }}
+      LAN_IP: 192.168.50.1
+      HOSTNAME: Athena-DAED
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v5
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          sudo docker image prune -af || true
+          df -h
+
+      - name: Initialize build environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y \
+            build-essential clang llvm lld flex bison g++ gawk gcc-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools \
+            python3-pyelftools rsync swig unzip zlib1g-dev file wget \
+            curl jq qemu-utils ccache dos2unix
+          sudo bash -c 'bash <(curl -fsSL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo timedatectl set-timezone Asia/Shanghai
+
+      - name: Clone Athena source
+        run: |
+          set -eux
+          git init openwrt
+          git -C openwrt remote add origin "$SOURCE_REPO"
+          git -C openwrt fetch --depth=1 origin "$SOURCE_REF"
+          git -C openwrt checkout --detach FETCH_HEAD
+
+          SOURCE_COMMIT="$(git -C openwrt rev-parse HEAD)"
+          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "SOURCE_SHORT=${SOURCE_COMMIT:0:8}" >> "$GITHUB_ENV"
+          git -C openwrt log -1 --oneline
+
+      - name: Audit source integrity
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          echo "===== Device support ====="
+          grep -q '^define Device/jdcloud_re-cs-02'             target/linux/qualcommax/image/ipq60xx.mk
+          grep -q '^TARGET_DEVICES += jdcloud_re-cs-02'             target/linux/qualcommax/image/ipq60xx.mk
+
+          echo "===== Kernel layout ====="
+          TARGET_KERNEL="$(
+            sed -n 's/^[[:space:]]*KERNEL_PATCHVER[[:space:]]*:=[[:space:]]*//p'               target/linux/qualcommax/Makefile | head -1 | tr -d '[:space:]'
+          )"
+          BPF_HEADERS_KERNEL="$(
+            sed -n 's/^[[:space:]]*PKG_PATCHVER[[:space:]]*:=[[:space:]]*//p'               package/kernel/bpf-headers/Makefile | head -1 | tr -d '[:space:]'
+          )"
+
+          echo "target_kernel=$TARGET_KERNEL"
+          echo "bpf_headers_kernel=$BPF_HEADERS_KERNEL"
+
+          test -n "$TARGET_KERNEL"
+          test -n "$BPF_HEADERS_KERNEL"
+          test -f "target/linux/generic/kernel-$TARGET_KERNEL"
+          test -f "target/linux/generic/kernel-$BPF_HEADERS_KERNEL"
+          test -d "target/linux/generic/pending-$BPF_HEADERS_KERNEL"
+
+          # bpf-headers being pinned to 6.12 is intentional in upstream OpenWrt.
+          test "$BPF_HEADERS_KERNEL" = "6.12"
+
+          echo "===== Unresolved merge-conflict scan ====="
+          CONFLICTS="$(
+            grep -RIlE '^(<<<<<<< |>>>>>>> )'               target/linux package/kernel/bpf-headers include 2>/dev/null || true
+          )"
+          if [ -n "$CONFLICTS" ]; then
+            echo "::error::Unresolved Git merge-conflict markers found:"
+            printf '%s\n' "$CONFLICTS"
+            exit 1
+          fi
+
+          # Explicitly verify the two files that were corrupt in the old source.
+          for patch in             target/linux/generic/pending-6.12/711-07-net-dsa-qca8k-use-correct-CPU-port-when-having-multi.patch             target/linux/generic/pending-6.12/711-08-net-dsa-qca8k-implement-ds-ops-preferred_default_loc.patch
+          do
+            test -s "$patch"
+            ! grep -qE '^(<<<<<<< |>>>>>>> )' "$patch"
+          done
+
+          git diff --check
+          echo "TARGET_KERNEL=$TARGET_KERNEL" >> "$GITHUB_ENV"
+          echo "BPF_HEADERS_KERNEL=$BPF_HEADERS_KERNEL" >> "$GITHUB_ENV"
+
+      - name: Update feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Fetch DAED and geodata packages
+        run: |
+          set -eux
+
+          git init /tmp/openwrt-daede
+          git -C /tmp/openwrt-daede remote add origin "$DAEDE_REPO"
+          git -C /tmp/openwrt-daede fetch --depth=1 origin "$DAEDE_REF"
+          git -C /tmp/openwrt-daede checkout --detach FETCH_HEAD
+
+          git clone --depth=1 "$GEODATA_REPO" /tmp/passwall-packages
+
+          DAEDE_COMMIT="$(git -C /tmp/openwrt-daede rev-parse HEAD)"
+          echo "DAEDE_COMMIT=$DAEDE_COMMIT" >> "$GITHUB_ENV"
+          echo "DAEDE_SHORT=${DAEDE_COMMIT:0:8}" >> "$GITHUB_ENV"
+
+          DAED_VERSION="$(sed -n 's/^PKG_VERSION:=//p' /tmp/openwrt-daede/daed/Makefile | head -1)"
+          LUCI_VERSION="$(sed -n 's/^PKG_VERSION:=//p' /tmp/openwrt-daede/luci-app-daede/Makefile | head -1)"
+          echo "DAED_VERSION=$DAED_VERSION" >> "$GITHUB_ENV"
+          echo "LUCI_DAEDE_VERSION=$LUCI_VERSION" >> "$GITHUB_ENV"
+
+          cd openwrt
+          mkdir -p package/custom
+
+          rm -rf \
+            package/custom/dae \
+            package/custom/daed \
+            package/custom/luci-app-daede \
+            package/custom/v2ray-geodata \
+            package/feeds/*/dae \
+            package/feeds/*/daed \
+            package/feeds/*/luci-app-daede \
+            package/feeds/*/v2ray-geodata 2>/dev/null || true
+
+          cp -a /tmp/openwrt-daede/daed package/custom/
+          cp -a /tmp/openwrt-daede/luci-app-daede package/custom/
+          cp -a /tmp/passwall-packages/v2ray-geodata package/custom/
+
+          test -f package/custom/daed/Makefile
+          test -f package/custom/luci-app-daede/Makefile
+          test -f package/custom/v2ray-geodata/Makefile
+
+      - name: Apply optimized DAED configuration
+        run: |
+          set -eux
+          cd openwrt
+
+          # 优先使用仓库中的自定义配置；若用户漏传，则自动生成默认配置。
+          if [ -s "$GITHUB_WORKSPACE/config/athena-daed.config" ]; then
+            echo "Using repository config/athena-daed.config"
+            sed 's/\r$//' "$GITHUB_WORKSPACE/config/athena-daed.config" > .config
+          else
+            echo "config/athena-daed.config not found; generating built-in safe default."
+            cat > .config <<'ATHENA_CONFIG'
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq60xx=y
+          CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_jdcloud_re-cs-02=y
+          CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+
+          CONFIG_CCACHE=y
+          CONFIG_DEVEL=y
+          CONFIG_BPF_TOOLCHAIN_HOST=y
+          CONFIG_BPF_TOOLCHAIN_HOST_PATH="/usr"
+          # CONFIG_BPF_TOOLCHAIN_NONE is not set
+          CONFIG_USE_LLVM_HOST=y
+          # CONFIG_USE_LLVM_PREBUILT is not set
+          # CONFIG_USE_LLVM_BUILD is not set
+          CONFIG_KERNEL_CC_OPTIMIZE_FOR_PERFORMANCE=y
+          CONFIG_ATH11K_MEM_PROFILE_1G=y
+          CONFIG_IPQ_MEM_PROFILE_1024=y
+
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-base=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_firewall4=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+
+          CONFIG_KERNEL_BPF_SYSCALL=y
+          CONFIG_KERNEL_BPF_JIT=y
+          CONFIG_KERNEL_CGROUPS=y
+          CONFIG_KERNEL_CGROUP_BPF=y
+          CONFIG_KERNEL_KPROBES=y
+          CONFIG_KERNEL_KPROBE_EVENTS=y
+          CONFIG_KERNEL_BPF_EVENTS=y
+          CONFIG_KERNEL_BPF_STREAM_PARSER=y
+          CONFIG_KERNEL_NET_INGRESS=y
+          CONFIG_KERNEL_NET_EGRESS=y
+          CONFIG_KERNEL_NET_CLS_ACT=y
+          CONFIG_KERNEL_DEBUG_INFO=y
+          # CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
+          CONFIG_KERNEL_DEBUG_INFO_BTF=y
+          CONFIG_KERNEL_XDP_SOCKETS=y
+
+          CONFIG_PACKAGE_kmod-sched-core=y
+          CONFIG_PACKAGE_kmod-sched-bpf=y
+          CONFIG_PACKAGE_kmod-veth=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-tun=y
+
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_v2ray-geoip=y
+          CONFIG_PACKAGE_v2ray-geosite=y
+          CONFIG_PACKAGE_daed=y
+          CONFIG_DAED_USE_KERNEL_BTF=y
+          # CONFIG_DAED_USE_VMLINUX_BTF is not set
+          CONFIG_PACKAGE_luci-app-daede=y
+          CONFIG_PACKAGE_luci-app-daede_daed=y
+          # CONFIG_PACKAGE_luci-app-daede_dae is not set
+          # CONFIG_PACKAGE_dae is not set
+
+          CONFIG_PACKAGE_kmod-qca-nss-drv=y
+          CONFIG_PACKAGE_kmod-qca-nss-drv-pppoe=y
+          CONFIG_PACKAGE_kmod-qca-nss-drv-qdisc=y
+          CONFIG_PACKAGE_kmod-qca-nss-drv-bridge-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-drv-vlan-mgr=y
+          CONFIG_PACKAGE_kmod-qca-nss-ecm=m
+
+          CONFIG_PACKAGE_kmod-nft-bridge=y
+          CONFIG_PACKAGE_kmod-nft-core=y
+          CONFIG_PACKAGE_kmod-nft-fib=y
+          CONFIG_PACKAGE_kmod-nft-xfrm=y
+          CONFIG_PACKAGE_kmod-nft-offload=n
+          CONFIG_PACKAGE_kmod-nft-fullcone=n
+
+          CONFIG_PACKAGE_kmod-dsa=y
+          CONFIG_PACKAGE_kmod-mmc=y
+          CONFIG_PACKAGE_kmod-sdhci=y
+          CONFIG_PACKAGE_kmod-sdhci-msm=y
+          CONFIG_PACKAGE_luci-app-athena-led=y
+          CONFIG_PACKAGE_iwinfo=y
+          CONFIG_PACKAGE_luci-app-wireless-regdb=y
+
+          CONFIG_PACKAGE_block-mount=y
+          CONFIG_PACKAGE_luci-app-mountd=y
+          CONFIG_PACKAGE_luci-app-partexp=y
+          CONFIG_PACKAGE_resize2fs=y
+          CONFIG_PACKAGE_tune2fs=y
+          CONFIG_PACKAGE_kmod-fs-ext4=y
+          CONFIG_PACKAGE_e2fsprogs=y
+          CONFIG_PACKAGE_fdisk=y
+          CONFIG_PACKAGE_gdisk=y
+          CONFIG_PACKAGE_lsblk=y
+
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_dmesg=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_iperf3=y
+          CONFIG_PACKAGE_openssl-util=y
+          CONFIG_PACKAGE_openssh-sftp-server=y
+
+          CONFIG_PACKAGE_luci-app-passwall=n
+          CONFIG_PACKAGE_luci-app-passwall2=n
+          CONFIG_PACKAGE_luci-app-openclash=n
+          CONFIG_PACKAGE_luci-app-homeproxy=n
+          CONFIG_PACKAGE_luci-app-mosdns=n
+          CONFIG_PACKAGE_luci-app-smartdns=n
+          CONFIG_PACKAGE_luci-app-adguardhome=n
+          CONFIG_PACKAGE_luci-app-dockerman=n
+          CONFIG_PACKAGE_docker=n
+          CONFIG_PACKAGE_dockerd=n
+          ATHENA_CONFIG
+          fi
+
+          # DAE/DAED 的 eBPF 构建必须明确选择宿主机 LLVM。
+          # 无论仓库是否自带 config，都强制覆盖为 GitHub Runner 的 /usr/bin 工具链。
+          cat >> .config <<'BPF_TOOLCHAIN_CONFIG'
+          CONFIG_DEVEL=y
+          CONFIG_BPF_TOOLCHAIN_HOST=y
+          CONFIG_BPF_TOOLCHAIN_HOST_PATH="/usr"
+          # CONFIG_BPF_TOOLCHAIN_NONE is not set
+          CONFIG_USE_LLVM_HOST=y
+          # CONFIG_USE_LLVM_PREBUILT is not set
+          # CONFIG_USE_LLVM_BUILD is not set
+          BPF_TOOLCHAIN_CONFIG
+
+          # 首次启动时设置管理地址和主机名。
+          mkdir -p package/base-files/files/etc/uci-defaults
+          cat > package/base-files/files/etc/uci-defaults/99-athena-daed-defaults <<EOF
+          #!/bin/sh
+          uci set network.lan.ipaddr='$LAN_IP'
+          uci set system.@system[0].hostname='$HOSTNAME'
+          uci commit network
+          uci commit system
+          exit 0
+          EOF
+          chmod +x package/base-files/files/etc/uci-defaults/99-athena-daed-defaults
+
+          make defconfig
+          cp .config "$GITHUB_WORKSPACE/config.final"
+
+      - name: Verify DAED kernel and dashboard configuration
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          echo "===== Host LLVM/BPF toolchain ====="
+          for tool in clang llc llvm-dis opt llvm-strip; do
+            path="$(command -v "$tool" || true)"
+            if [ -z "$path" ]; then
+              echo "::error::Missing host LLVM tool: $tool"
+              exit 1
+            fi
+            echo "$tool=$path"
+          done
+
+          CLANG_MAJOR="$(clang -dM -E -x c /dev/null | awk '/__clang_major__/ {print $3; exit}')"
+          echo "clang_major=$CLANG_MAJOR"
+          clang --version | head -1
+          if [ -z "$CLANG_MAJOR" ] || [ "$CLANG_MAJOR" -lt 12 ]; then
+            echo "::error::Clang 12 or newer is required."
+            exit 1
+          fi
+
+          required=(
+            "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_jdcloud_re-cs-02=y"
+            "CONFIG_BPF_TOOLCHAIN_HOST=y"
+            "CONFIG_USE_LLVM_HOST=y"
+            "CONFIG_KERNEL_DEBUG_INFO=y"
+            "CONFIG_KERNEL_DEBUG_INFO_BTF=y"
+            "CONFIG_KERNEL_XDP_SOCKETS=y"
+            "CONFIG_KERNEL_KPROBES=y"
+            "CONFIG_KERNEL_KPROBE_EVENTS=y"
+            "CONFIG_KERNEL_BPF_EVENTS=y"
+            "CONFIG_PACKAGE_kmod-sched-bpf=y"
+            "CONFIG_PACKAGE_kmod-veth=y"
+            "CONFIG_PACKAGE_daed=y"
+            "CONFIG_DAED_USE_KERNEL_BTF=y"
+            "CONFIG_PACKAGE_luci-app-daede=y"
+            "CONFIG_PACKAGE_luci-app-daede_daed=y"
+          )
+
+          failed=0
+          for item in "${required[@]}"; do
+            if ! grep -qxF "$item" .config; then
+              echo "::error::Missing after make defconfig: $item"
+              failed=1
+            fi
+          done
+
+          if grep -qxF "CONFIG_PACKAGE_dae=y" .config; then
+            echo "::error::Lightweight dae backend was unexpectedly selected."
+            failed=1
+          fi
+
+          echo "===== DAED version ====="
+          echo "daed package: $DAED_VERSION"
+          echo "luci-app-daede: $LUCI_DAEDE_VERSION"
+          echo "daede source: $DAEDE_COMMIT"
+
+          echo "===== Effective selections ====="
+          grep -E \
+            'CONFIG_(BPF_TOOLCHAIN_HOST|USE_LLVM_HOST|KERNEL_DEBUG_INFO_BTF|KERNEL_XDP_SOCKETS|PACKAGE_daed|DAED_USE_KERNEL_BTF|PACKAGE_luci-app-daede|PACKAGE_luci-app-daede_daed|PACKAGE_kmod-sched-bpf|PACKAGE_kmod-veth)=' \
+            .config || true
+
+          if [ "$failed" -ne 0 ]; then
+            echo "Configuration validation failed."
+            exit 1
+          fi
+
+          echo "[OK] DAED dashboard, integrated BTF and required eBPF components are selected."
+
+      - name: Cache compiler output
+        if: ${{ !inputs.config_only }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/.ccache
+          key: athena-daed-clean-upstream-v1-${{ runner.os }}-${{ env.SOURCE_COMMIT }}-${{ env.DAEDE_COMMIT }}
+          restore-keys: |
+            athena-daed-${{ runner.os }}-
+
+      - name: BPF toolchain compile preflight
+        if: ${{ !inputs.config_only }}
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          grep -qxF 'CONFIG_BPF_TOOLCHAIN_HOST=y' .config
+          grep -qxF 'CONFIG_USE_LLVM_HOST=y' .config
+
+          echo "PATH=$PATH"
+          clang --version
+          llc --version | head -5
+          llvm-strip --version | head -1
+
+          # 用与 OpenWrt bpf.mk 相同的基本方式验证 Clang 能生成 BPF 目标。
+          printf 'int x;\n' | clang --target=bpfel -x c -c -o /tmp/clang-bpf-test.o -
+          test -s /tmp/clang-bpf-test.o
+          file /tmp/clang-bpf-test.o
+          rm -f /tmp/clang-bpf-test.o
+
+      - name: Download sources
+        if: ${{ !inputs.config_only }}
+        run: |
+          cd openwrt
+          make download -j"$(nproc)"
+          find dl -type f -size -1024c -delete
+
+      - name: Compile BPF headers first
+        if: ${{ !inputs.config_only }}
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          echo "Target kernel: $TARGET_KERNEL"
+          echo "BPF headers kernel: $BPF_HEADERS_KERNEL"
+          grep -n '^PKG_PATCHVER:=' package/kernel/bpf-headers/Makefile
+
+          make package/kernel/bpf-headers/clean
+          make package/kernel/bpf-headers/compile -j1 V=s
+
+      - name: Compile firmware
+        if: ${{ !inputs.config_only }}
+        run: |
+          cd openwrt
+          make -j"$(nproc)" || make -j1 V=s
+
+      - name: Collect output
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          set +e
+          mkdir -p output
+
+          [ -f config.final ] && cp -f config.final output/athena-daed-final.config
+          [ -f docs/刷机与DAED验收说明.md ] && cp -f docs/刷机与DAED验收说明.md output/
+
+          cat > output/verify-after-flash.sh <<'VERIFY_SCRIPT'
+          #!/bin/sh
+          echo "===== System ====="
+          uname -a
+          echo
+          echo "===== Integrated BTF ====="
+          if [ -r /sys/kernel/btf/vmlinux ]; then
+            ls -lh /sys/kernel/btf/vmlinux
+            echo "BTF_OK"
+          else
+            echo "BTF_MISSING"
+          fi
+          echo
+          echo "===== Packages ====="
+          opkg list-installed 2>/dev/null | grep -E '^(daed|luci-app-daede|kmod-sched-bpf|kmod-veth|v2ray-geo)' || true
+          echo
+          echo "===== DAED ====="
+          command -v daed && (daed --version 2>/dev/null || true)
+          /etc/init.d/daed status 2>/dev/null || true
+          VERIFY_SCRIPT
+          chmod +x output/verify-after-flash.sh
+
+          if [ -d openwrt/bin/targets/qualcommax/ipq60xx ]; then
+            find openwrt/bin/targets/qualcommax/ipq60xx -maxdepth 1 -type f \
+              \( -name '*jdcloud_re-cs-02*' -o -name '*.manifest' -o -name 'sha256sums' -o -name '*.buildinfo' \) \
+              -exec cp -f {} output/ \;
+          fi
+
+          find openwrt/bin -type f -name 'kmod-qca-nss-ecm*.ipk' \
+            -exec cp -f {} output/ \; 2>/dev/null || true
+
+          {
+            echo "result=$RESULT"
+            echo "source_repo=$SOURCE_REPO"
+            echo "source_ref=$SOURCE_REF"
+            echo "source_commit=${SOURCE_COMMIT:-unavailable}"
+            echo "target_kernel=${TARGET_KERNEL:-unavailable}"
+            echo "bpf_headers_kernel=${BPF_HEADERS_KERNEL:-unavailable}"
+            echo "daede_ref=$DAEDE_REF"
+            echo "daede_commit=${DAEDE_COMMIT:-unavailable}"
+            echo "daed_version=${DAED_VERSION:-unavailable}"
+            echo "luci_daede_version=${LUCI_DAEDE_VERSION:-unavailable}"
+            echo "lan_ip=$LAN_IP"
+            echo "backend=daed"
+            echo "generated=$(date -Iseconds)"
+          } > output/BUILD_INFO.txt
+
+          ls -lh output
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Athena-AX6600-DAED-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 14
